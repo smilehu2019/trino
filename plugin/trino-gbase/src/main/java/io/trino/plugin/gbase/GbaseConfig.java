@@ -16,7 +16,6 @@ package io.trino.plugin.gbase;
 import io.airlift.configuration.Config;
 import io.airlift.configuration.ConfigDescription;
 import io.airlift.units.Duration;
-
 import jakarta.validation.constraints.Min;
 
 import java.util.concurrent.TimeUnit;

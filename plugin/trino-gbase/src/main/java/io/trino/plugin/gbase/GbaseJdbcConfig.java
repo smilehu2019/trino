@@ -15,7 +15,6 @@ package io.trino.plugin.gbase;
 
 import com.gbase.jdbc.Driver;
 import io.trino.plugin.jdbc.BaseJdbcConfig;
-
 import jakarta.validation.constraints.AssertTrue;
 
 import java.sql.SQLException;
