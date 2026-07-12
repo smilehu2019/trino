@@ -64,6 +64,7 @@ import io.trino.spi.connector.JoinCondition;
 import io.trino.spi.connector.JoinStatistics;
 import io.trino.spi.connector.JoinType;
 import io.trino.spi.connector.SchemaTableName;
+import io.trino.spi.expression.ConnectorExpression;
 import io.trino.spi.predicate.Domain;
 import io.trino.spi.predicate.ValueSet;
 import io.trino.spi.type.CharType;
@@ -96,6 +97,7 @@ import java.util.stream.Stream;
 import static com.google.common.base.Preconditions.checkArgument;
 import static com.google.common.base.Strings.emptyToNull;
 import static com.google.common.base.Verify.verify;
+import static com.google.common.util.concurrent.MoreExecutors.directExecutor;
 import static io.airlift.slice.Slices.utf8Slice;
 import static io.trino.plugin.base.util.JsonTypeUtil.jsonParse;
 import static io.trino.plugin.jdbc.DecimalConfig.DecimalMapping.ALLOW_OVERFLOW;
@@ -127,6 +129,7 @@ import static io.trino.plugin.jdbc.StandardColumnMappings.smallintColumnMapping;
 import static io.trino.plugin.jdbc.StandardColumnMappings.smallintWriteFunction;
 import static io.trino.plugin.jdbc.StandardColumnMappings.timeReadFunction;
 import static io.trino.plugin.jdbc.StandardColumnMappings.timeWriteFunction;
+import static io.trino.plugin.jdbc.StandardColumnMappings.timestampReadFunction;
 import static io.trino.plugin.jdbc.StandardColumnMappings.timestampWriteFunction;
 import static io.trino.plugin.jdbc.StandardColumnMappings.tinyintColumnMapping;
 import static io.trino.plugin.jdbc.StandardColumnMappings.tinyintWriteFunction;
@@ -256,6 +259,12 @@ public class GbaseClient
     }
 
     @Override
+    public Optional<ParameterizedExpression> convertPredicate(ConnectorSession session, ConnectorExpression expression, Map<String, ColumnHandle> assignments)
+    {
+        return connectorExpressionRewriter.rewrite(session, expression, assignments);
+    }
+
+    @Override
     public boolean supportsAggregationPushdown(ConnectorSession session, JdbcTableHandle table, List<AggregateFunction> aggregates, Map<String, ColumnHandle> assignments, List<List<ColumnHandle>> groupingSets)
     {
         // Remote database can be case insensitive.
@@ -265,6 +274,16 @@ public class GbaseClient
     private static Optional<JdbcTypeHandle> toTypeHandle(DecimalType decimalType)
     {
         return Optional.of(new JdbcTypeHandle(Types.NUMERIC, Optional.of("decimal"), Optional.of(decimalType.getPrecision()), Optional.of(decimalType.getScale()), Optional.empty(), Optional.empty()));
+    }
+
+    @Override
+    protected boolean filterRemoteSchema(String schemaName)
+    {
+        if (schemaName.equalsIgnoreCase("mysql")
+                || schemaName.equalsIgnoreCase("sys")) {
+            return false;
+        }
+        return super.filterRemoteSchema(schemaName);
     }
 
     @Override
@@ -294,11 +313,7 @@ public class GbaseClient
         if (!resultSet.isAfterLast()) {
             // Abort connection before closing. Without this, the GBase driver
             // attempts to drain the connection by reading all the results.
-            log.debug("trace abortReadConnection true");
-            connection.close();
-        }
-        else {
-            log.debug("trace abortReadConnection false");
+            connection.abort(directExecutor());
         }
     }
 
@@ -377,101 +392,89 @@ public class GbaseClient
             return mapping;
         }
 
-        switch (jdbcTypeName.toLowerCase(ENGLISH)) {
-            case "tinyint unsigned":
-                return Optional.of(smallintColumnMapping());
-            case "smallint unsigned":
-                return Optional.of(integerColumnMapping());
-            case "int unsigned":
-                return Optional.of(bigintColumnMapping());
-            case "bigint unsigned":
-                return Optional.of(decimalColumnMapping(createDecimalType(20)));
-            case "json":
-                return Optional.of(jsonColumnMapping());
-            case "enum":
-                return Optional.of(defaultVarcharColumnMapping(typeHandle.requiredColumnSize(), false));
+        Optional<ColumnMapping> jdbcTypeNameMapping = switch (jdbcTypeName.toLowerCase(ENGLISH)) {
+            case "tinyint unsigned" -> Optional.of(smallintColumnMapping());
+            case "smallint unsigned" -> Optional.of(integerColumnMapping());
+            case "int unsigned" -> Optional.of(bigintColumnMapping());
+            case "bigint unsigned" -> Optional.of(decimalColumnMapping(createDecimalType(20)));
+            case "json" -> Optional.of(jsonColumnMapping());
+            case "enum" -> Optional.of(defaultVarcharColumnMapping(typeHandle.requiredColumnSize(), false));
+            default -> Optional.empty();
+        };
+        if (jdbcTypeNameMapping.isPresent()) {
+            return jdbcTypeNameMapping;
         }
 
-        switch (typeHandle.jdbcType()) {
-            case Types.BIT:
-                return Optional.of(booleanColumnMapping());
+        Optional<ColumnMapping> jdbcTypeMapping = switch (typeHandle.jdbcType()) {
+            case Types.BIT -> Optional.of(booleanColumnMapping());
 
-            case Types.TINYINT:
-                return Optional.of(tinyintColumnMapping());
+            case Types.TINYINT -> Optional.of(tinyintColumnMapping());
 
-            case Types.SMALLINT:
-                return Optional.of(smallintColumnMapping());
+            case Types.SMALLINT -> Optional.of(smallintColumnMapping());
 
-            case Types.INTEGER:
-                return Optional.of(integerColumnMapping());
+            case Types.INTEGER -> Optional.of(integerColumnMapping());
 
-            case Types.BIGINT:
-                return Optional.of(bigintColumnMapping());
+            case Types.BIGINT -> Optional.of(bigintColumnMapping());
 
-            case Types.REAL:
-                // Disable pushdown because floating-point values are approximate and not stored as exact values,
-                // attempts to treat them as exact in comparisons may lead to problems
-                return Optional.of(ColumnMapping.longMapping(
-                        REAL,
-                        (resultSet, columnIndex) -> floatToRawIntBits(resultSet.getFloat(columnIndex)),
-                        realWriteFunction(),
-                        DISABLE_PUSHDOWN));
+            case Types.REAL -> Optional.of(ColumnMapping.longMapping(
+                    REAL,
+                    (resultSet, columnIndex) -> floatToRawIntBits(resultSet.getFloat(columnIndex)),
+                    realWriteFunction(),
+                    DISABLE_PUSHDOWN));
 
-            case Types.DOUBLE:
-                return Optional.of(doubleColumnMapping());
+            case Types.DOUBLE -> Optional.of(doubleColumnMapping());
 
-            case Types.NUMERIC:
-            case Types.DECIMAL:
+            case Types.NUMERIC, Types.DECIMAL -> {
                 int decimalDigits = typeHandle.decimalDigits().orElseThrow(() -> new IllegalStateException("decimal digits not present"));
                 int precision = typeHandle.requiredColumnSize();
                 if (getDecimalRounding(session) == ALLOW_OVERFLOW && precision > Decimals.MAX_PRECISION) {
                     int scale = min(decimalDigits, getDecimalDefaultScale(session));
-                    return Optional.of(decimalColumnMapping(createDecimalType(Decimals.MAX_PRECISION, scale), getDecimalRoundingMode(session)));
+                    yield Optional.of(decimalColumnMapping(createDecimalType(Decimals.MAX_PRECISION, scale), getDecimalRoundingMode(session)));
                 }
-                // TODO does GBase support negative scale?
-                precision = precision + max(-decimalDigits, 0); // Map decimal(p, -s) (negative scale) to decimal(p+s, 0).
+                precision = precision + max(-decimalDigits, 0);
                 if (precision > Decimals.MAX_PRECISION) {
-                    break;
+                    yield Optional.empty();
                 }
-                return Optional.of(decimalColumnMapping(createDecimalType(precision, max(decimalDigits, 0))));
+                yield Optional.of(decimalColumnMapping(createDecimalType(precision, max(decimalDigits, 0))));
+            }
 
-            case Types.CHAR:
-                return Optional.of(defaultCharColumnMapping(typeHandle.requiredColumnSize(), false));
+            case Types.CHAR -> Optional.of(defaultCharColumnMapping(typeHandle.requiredColumnSize(), false));
 
-            // TODO not all these type constants are necessarily used by the JDBC driver
-            case Types.VARCHAR:
-            case Types.NVARCHAR:
-            case Types.LONGVARCHAR:
-            case Types.LONGNVARCHAR:
-                return Optional.of(defaultVarcharColumnMapping(typeHandle.requiredColumnSize(), false));
+            case Types.VARCHAR, Types.NVARCHAR, Types.LONGVARCHAR, Types.LONGNVARCHAR ->
+                    Optional.of(defaultVarcharColumnMapping(typeHandle.requiredColumnSize(), false));
 
-            case Types.BINARY:
-            case Types.VARBINARY:
-            case Types.LONGVARBINARY:
-                return Optional.of(ColumnMapping.sliceMapping(VARBINARY, varbinaryReadFunction(), varbinaryWriteFunction(), FULL_PUSHDOWN));
+            case Types.BINARY, Types.VARBINARY, Types.LONGVARBINARY ->
+                    Optional.of(ColumnMapping.sliceMapping(VARBINARY, varbinaryReadFunction(), varbinaryWriteFunction(), FULL_PUSHDOWN));
 
-            case Types.DATE:
-                return Optional.of(ColumnMapping.longMapping(
-                        DATE,
-                        gbaseDateReadFunctionUsingLocalDate(),
-                        gbaseDateWriteFunctionUsingLocalDate()));
+            case Types.DATE -> Optional.of(ColumnMapping.longMapping(
+                    DATE,
+                    gbaseDateReadFunctionUsingLocalDate(),
+                    gbaseDateWriteFunctionUsingLocalDate()));
 
-            case Types.TIME:
+            case Types.TIME -> {
                 TimeType timeType = createTimeType(getTimePrecision(typeHandle.requiredColumnSize()));
                 requireNonNull(timeType, "timeType is null");
                 checkArgument(timeType.getPrecision() <= 9, "Unsupported type precision: %s", timeType);
-                return Optional.of(ColumnMapping.longMapping(
+                yield Optional.of(ColumnMapping.longMapping(
                         timeType,
                         gbaseTimeReadFunction(timeType),
                         timeWriteFunction(timeType.getPrecision())));
+            }
 
-            case Types.TIMESTAMP:
+            case Types.TIMESTAMP -> {
                 TimestampType timestampType = createTimestampType(getTimestampPrecision(typeHandle.requiredColumnSize()));
                 checkArgument(timestampType.getPrecision() <= TimestampType.MAX_SHORT_PRECISION, "Precision is out of range: %s", timestampType.getPrecision());
-                return Optional.of(ColumnMapping.longMapping(
+                yield Optional.of(ColumnMapping.longMapping(
                         timestampType,
                         gbaseTimestampReadFunction(timestampType),
                         timestampWriteFunction(timestampType)));
+            }
+
+            default -> Optional.empty();
+        };
+
+        if (jdbcTypeMapping.isPresent()) {
+            return jdbcTypeMapping;
         }
 
         if (getUnsupportedTypeHandling(session) == CONVERT_TO_VARCHAR) {
@@ -487,21 +490,15 @@ public class GbaseClient
             public boolean isNull(ResultSet resultSet, int columnIndex)
                     throws SQLException
             {
-                Object value = resultSet.getObject(columnIndex);
-                if (null == value) {
-                    return true;
-                }
-
-                return value.toString().isEmpty();
+                resultSet.getObject(columnIndex, LocalDate.class);
+                return resultSet.wasNull();
             }
 
             @Override
             public long readLong(ResultSet resultSet, int columnIndex)
                     throws SQLException
             {
-                LocalDate localDate = LocalDate.parse(resultSet.getObject(columnIndex).toString(),
-                        DateTimeFormatter.ofPattern("yyyy-MM-dd"));
-                return localDate.toEpochDay();
+                return resultSet.getObject(columnIndex, LocalDate.class).toEpochDay();
             }
         };
     }
@@ -528,26 +525,21 @@ public class GbaseClient
     {
         return new LongReadFunction()
         {
+            private final LongReadFunction delegate = timestampReadFunction(timestampType);
+
             @Override
             public boolean isNull(ResultSet resultSet, int columnIndex)
                     throws SQLException
             {
-                // super calls ResultSet#getObject(), which for TIMESTAMP type returns java.sql.Timestamp, for which the conversion can fail if the value isn't a valid instant in server's time zone.
-                Object value = resultSet.getObject(columnIndex);
-                if (null == value) {
-                    return true;
-                }
-
-                return value.toString().isEmpty();
+                resultSet.getObject(columnIndex, LocalDateTime.class);
+                return resultSet.wasNull();
             }
 
             @Override
             public long readLong(ResultSet resultSet, int columnIndex)
                     throws SQLException
             {
-                LocalDateTime localDateTime = LocalDateTime.parse(resultSet.getObject(columnIndex).toString(),
-                        DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.S"));
-                return toTrinoTimestamp(timestampType, localDateTime);
+                return delegate.readLong(resultSet, columnIndex);
             }
         };
     }
@@ -779,23 +771,16 @@ public class GbaseClient
                         String ordering = sortItem.sortOrder().isAscending() ? "ASC" : "DESC";
                         String columnSorting = format("%s %s", quoted(sortItem.column().getColumnName()), ordering);
 
-                        switch (sortItem.sortOrder()) {
-                            case ASC_NULLS_FIRST:
-                                // In GBase ASC implies NULLS FIRST
-                            case DESC_NULLS_LAST:
-                                // In GBase DESC implies NULLS LAST
-                                return Stream.of(columnSorting);
+                        return switch (sortItem.sortOrder()) {
+                            case ASC_NULLS_FIRST, DESC_NULLS_LAST -> Stream.of(columnSorting);
 
-                            case ASC_NULLS_LAST:
-                                return Stream.of(
-                                        format("ISNULL(%s) ASC", quoted(sortItem.column().getColumnName())),
-                                        columnSorting);
-                            case DESC_NULLS_FIRST:
-                                return Stream.of(
-                                        format("ISNULL(%s) DESC", quoted(sortItem.column().getColumnName())),
-                                        columnSorting);
-                        }
-                        throw new UnsupportedOperationException("Unsupported sort order: " + sortItem.sortOrder());
+                            case ASC_NULLS_LAST -> Stream.of(
+                                    format("ISNULL(%s) ASC", quoted(sortItem.column().getColumnName())),
+                                    columnSorting);
+                            case DESC_NULLS_FIRST -> Stream.of(
+                                    format("ISNULL(%s) DESC", quoted(sortItem.column().getColumnName())),
+                                    columnSorting);
+                        };
                     })
                     .collect(joining(", "));
             return format("%s ORDER BY %s LIMIT %s", query, orderBy, limit);
