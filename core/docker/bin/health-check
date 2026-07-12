@@ -1,0 +1,36 @@
+#!/bin/bash
+
+set -euo pipefail
+
+function get_property_value_or_default() {
+  local value
+  if value="$(grep "^$1=" "$2")"; then
+    printf '%s\n' "${value}" | cut -d'=' -f2
+  else
+    # property not found, return default
+    printf '%s\n' "$3"
+  fi
+}
+
+scheme=http
+config=/etc/trino/config.properties
+# prefer to use http even if https is enabled
+if [ "$(get_property_value_or_default 'http-server.http.enabled' "$config" "true")" == "false" ]; then
+    scheme=https
+    port=$(get_property_value_or_default http-server.https.port "$config" "8443")
+else
+    port=$(get_property_value_or_default http-server.http.port "$config" "8080")
+fi
+
+endpoint="$scheme://localhost:$port/v1/info"
+
+# add --insecure to disable certificate verification in curl, in case a self-signed certificate is being used
+if ! info=$(curl --fail --silent --show-error --insecure "$endpoint"); then
+    echo >&2 "Server is not responding to requests"
+    exit 1
+fi
+
+if ! grep -q '"starting":\s*false' <<<"$info" >/dev/null; then
+    echo >&2 "Server is starting"
+    exit 1
+fi
