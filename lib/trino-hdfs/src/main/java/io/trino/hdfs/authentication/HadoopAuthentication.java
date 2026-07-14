@@ -18,4 +18,12 @@ import org.apache.hadoop.security.UserGroupInformation;
 public interface HadoopAuthentication
 {
     UserGroupInformation getUserGroupInformation();
+
+    /**
+     * Returns the krb5.conf path used for Kerberos authentication.
+     */
+    default String getKrb5Conf()
+    {
+        return null;
+    }
 }
