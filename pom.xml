@@ -76,6 +76,7 @@
         <module>plugin/trino-exchange-hdfs</module>
         <module>plugin/trino-faker</module>
         <module>plugin/trino-functions-python</module>
+        <module>plugin/trino-gbase</module>
         <module>plugin/trino-geospatial</module>
         <module>plugin/trino-google-sheets</module>
         <module>plugin/trino-hive</module>
@@ -1030,6 +1031,12 @@
             <dependency>
                 <groupId>io.trino</groupId>
                 <artifactId>trino-filesystem-s3</artifactId>
+                <version>${project.version}</version>
+            </dependency>
+
+            <dependency>
+                <groupId>io.trino</groupId>
+                <artifactId>trino-gbase</artifactId>
                 <version>${project.version}</version>
             </dependency>
 
