@@ -97,12 +97,6 @@
         </artifact>
     </artifactSet>
 
-    <artifactSet to="plugin/geospatial">
-        <artifact id="${project.groupId}:trino-geospatial:zip:${project.version}">
-            <unpack />
-        </artifact>
-    </artifactSet>
-
     <artifactSet to="plugin/google-sheets">
         <artifact id="${project.groupId}:trino-google-sheets:zip:${project.version}">
             <unpack />
