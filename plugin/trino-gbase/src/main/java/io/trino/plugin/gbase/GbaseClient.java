@@ -84,7 +84,6 @@ import java.sql.SQLException;
 import java.sql.Types;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
-import java.time.format.DateTimeFormatter;
 import java.util.Collection;
 import java.util.List;
 import java.util.Map;
@@ -127,6 +126,7 @@ import static io.trino.plugin.jdbc.StandardColumnMappings.smallintColumnMapping;
 import static io.trino.plugin.jdbc.StandardColumnMappings.smallintWriteFunction;
 import static io.trino.plugin.jdbc.StandardColumnMappings.timeReadFunction;
 import static io.trino.plugin.jdbc.StandardColumnMappings.timeWriteFunction;
+import static io.trino.plugin.jdbc.StandardColumnMappings.timestampReadFunction;
 import static io.trino.plugin.jdbc.StandardColumnMappings.timestampWriteFunction;
 import static io.trino.plugin.jdbc.StandardColumnMappings.tinyintColumnMapping;
 import static io.trino.plugin.jdbc.StandardColumnMappings.tinyintWriteFunction;
@@ -291,10 +291,11 @@ public class GbaseClient
     public void abortReadConnection(Connection connection, ResultSet resultSet)
             throws SQLException
     {
-        if (!resultSet.isAfterLast()) {
-            // Abort connection before closing. Without this, the GBase driver
-            // attempts to drain the connection by reading all the results.
+        try {
             connection.abort(directExecutor());
+        }
+        catch (SQLException e) {
+            // ignore exception from abort
         }
     }
 
@@ -475,22 +476,15 @@ public class GbaseClient
             public boolean isNull(ResultSet resultSet, int columnIndex)
                     throws SQLException
             {
-                Object value = resultSet.getObject(columnIndex);
-                if (null == value) {
-                    return true;
-                }
-
-                return value.toString().isEmpty();
+                resultSet.getObject(columnIndex, LocalDate.class);
+                return resultSet.wasNull();
             }
 
             @Override
             public long readLong(ResultSet resultSet, int columnIndex)
                     throws SQLException
             {
-                LocalDate localDate = LocalDate.parse(
-                        resultSet.getObject(columnIndex).toString(),
-                        DateTimeFormatter.ofPattern("yyyy-MM-dd"));
-                return localDate.toEpochDay();
+                return resultSet.getObject(columnIndex, LocalDate.class).toEpochDay();
             }
         };
     }
@@ -518,27 +512,21 @@ public class GbaseClient
     {
         return new LongReadFunction()
         {
+            private final LongReadFunction delegate = timestampReadFunction(timestampType);
+
             @Override
             public boolean isNull(ResultSet resultSet, int columnIndex)
                     throws SQLException
             {
-                // super calls ResultSet#getObject(), which for TIMESTAMP type returns java.sql.Timestamp, for which the conversion can fail if the value isn't a valid instant in server's time zone.
-                Object value = resultSet.getObject(columnIndex);
-                if (null == value) {
-                    return true;
-                }
-
-                return value.toString().isEmpty();
+                resultSet.getObject(columnIndex, LocalDateTime.class);
+                return resultSet.wasNull();
             }
 
             @Override
             public long readLong(ResultSet resultSet, int columnIndex)
                     throws SQLException
             {
-                LocalDateTime localDateTime = LocalDateTime.parse(
-                        resultSet.getObject(columnIndex).toString(),
-                        DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss.S"));
-                return toTrinoTimestamp(timestampType, localDateTime);
+                return delegate.readLong(resultSet, columnIndex);
             }
         };
     }
